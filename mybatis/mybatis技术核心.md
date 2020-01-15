@@ -1148,9 +1148,506 @@ public RoutingStatementHandler(Executor executor, MappedStatement ms, Object par
  }
 ```
 
+#### 设置参数(ParameterHandler)
+
+``` java
+RoutingStatementHandler#parameterize 
+  PreparedStatementHandler#parameterize  //调用委托类的parameterize方法
+  	DefaultParameterHandler#setParameters //设置参数,ParameterHandler的默认实现
+  		ParameterMapping#getTypeHandler  //获取TypeHandler,未配置的话默认是UnknownTypeHandler
+  			BaseTypeHandler#setParameter //UnKnownTypeHandler的父类方法
+  				UnKnownTypeHandler#setNonNullParameter //设置不为空的参数
+  					resolveTypeHandler  //获取真正的参数类型
+  						TypeHandlerRegistry#typeHandlerRegistry  //获取真正的参数类型
+  					BaseTypeHandler#setParameter //获取真正的参数类型后调用父类的setParameter
+  						IntegerTypeHandler#setNonNullParameter //真正的参数类型设置参数
+```
 
 
-#### 设置参数
+
+##### PreparedStatementHandler
+
+###### parameterize
+
+``` java
+......
+protected final ParameterHandler parameterHandler; //在BaseStatementHandler中定义
+......
+@Override
+public void parameterize(Statement statement) throws SQLException {
+  parameterHandler.setParameters((PreparedStatement) statement);//设置参数
+}
+```
+
+#####  DefaultParameterHandler
+
+###### setParameters
+
+``` java
+public void setParameters(PreparedStatement ps) {
+    ErrorContext.instance().activity("setting parameters").object(mappedStatement.getParameterMap().getId());
+    List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
+    if (parameterMappings != null) {
+      for (int i = 0; i < parameterMappings.size(); i++) {
+        ParameterMapping parameterMapping = parameterMappings.get(i);
+        if (parameterMapping.getMode() != ParameterMode.OUT) {
+          Object value;
+          String propertyName = parameterMapping.getProperty();
+          if (boundSql.hasAdditionalParameter(propertyName)) { // issue #448 ask first for additional params
+            value = boundSql.getAdditionalParameter(propertyName);
+          } else if (parameterObject == null) {
+            value = null;
+          } else if (typeHandlerRegistry.hasTypeHandler(parameterObject.getClass())) {
+            value = parameterObject;
+          } else {
+            MetaObject metaObject = configuration.newMetaObject(parameterObject);
+            value = metaObject.getValue(propertyName);
+          }
+          //获取parameterMapping中的typeHandler
+          //如果xml文件中没有设置过TypeHandler,则默认用的是UnknownTypeHandler
+          TypeHandler typeHandler = parameterMapping.getTypeHandler();
+          JdbcType jdbcType = parameterMapping.getJdbcType();
+          if (value == null && jdbcType == null) {
+            jdbcType = configuration.getJdbcTypeForNull();
+          }
+          try {
+            //BaseTypeHandler是所有TypeHandler的父类,setParameter是BaseTypeHandler中的方法
+            typeHandler.setParameter(ps, i + 1, value, jdbcType);
+          } catch (TypeException e) {
+            throw new TypeException("Could not set parameters for mapping: " + parameterMapping + ". Cause: " + e, e);
+          } catch (SQLException e) {
+            throw new TypeException("Could not set parameters for mapping: " + parameterMapping + ". Cause: " + e, e);
+          }
+        }
+      }
+    }
+ }
+```
+
+##### BaseTypeHandler
+
+###### setParameter
+
+``` java
+public void setParameter(PreparedStatement ps, int i, T parameter, JdbcType jdbcType) throws SQLException {
+    if (parameter == null) {
+      if (jdbcType == null) {
+        throw new TypeException("JDBC requires that the JdbcType must be specified for all nullable parameters.");
+      }
+      try {
+        ps.setNull(i, jdbcType.TYPE_CODE);
+      } catch (SQLException e) {
+        throw new TypeException("Error setting null for parameter #" + i + " with JdbcType " + jdbcType + " . " +
+                "Try setting a different JdbcType for this parameter or a different jdbcTypeForNull configuration property. " +
+                "Cause: " + e, e);
+      }
+    } else {
+      try {
+       	//设置不为空的参数，该方法再子类中实现
+        setNonNullParameter(ps, i, parameter, jdbcType);
+      } catch (Exception e) {
+        throw new TypeException("Error setting non null for parameter #" + i + " with JdbcType " + jdbcType + " . " +
+                "Try setting a different JdbcType for this parameter or a different configuration property. " +
+                "Cause: " + e, e);
+      }
+    }
+ }
+//在子类中实现
+public abstract void setNonNullParameter(PreparedStatement ps, int i, T parameter, JdbcType jdbcType) throws SQLException;
+```
+
+##### UnKnownTypeHandler
+
+###### setNonNullParameter
+
+``` java
+@Override
+public void setNonNullParameter(PreparedStatement ps, int i, Object parameter, JdbcType jdbcType)
+      throws SQLException {
+  	//获取typeHandler的真正类型,如:可能是个IntegerTypeHander
+    TypeHandler handler = resolveTypeHandler(parameter, jdbcType);
+  	//获取了真正的typeHandler后，继续调用BaseTypeHandler.setParameter方法
+  	//然后在setParameter方法中会调用相关子类的setNonNullParameter方法
+    handler.setParameter(ps, i, parameter, jdbcType);
+ }
+```
+
+###### resolveTypeHandler
+
+``` java
+private TypeHandler<? extends Object> resolveTypeHandler(Object parameter, JdbcType jdbcType) {
+    TypeHandler<? extends Object> handler;
+    if (parameter == null) {
+      handler = OBJECT_TYPE_HANDLER;
+    } else {
+      //通过typeHandlerRegistry中根据参数的类型获取typeHandler
+      handler = typeHandlerRegistry.getTypeHandler(parameter.getClass(), jdbcType);
+      // check if handler is null (issue #270)
+      if (handler == null || handler instanceof UnknownTypeHandler) {
+        handler = OBJECT_TYPE_HANDLER;
+      }
+    }
+    return handler;
+ }
+```
+
+##### TypeHandlerRegistry
+
+TypeHandler的注册中心，里面封装了各个类型与TypeHandler的对应关系
+
+``` java
+private final Map<JdbcType, TypeHandler<?>> JDBC_TYPE_HANDLER_MAP = new EnumMap<>(JdbcType.class);
+private final Map<Type, Map<JdbcType, TypeHandler<?>>> TYPE_HANDLER_MAP = new ConcurrentHashMap<>();
+private final TypeHandler<Object> UNKNOWN_TYPE_HANDLER = new UnknownTypeHandler(this);
+private final Map<Class<?>, TypeHandler<?>> ALL_TYPE_HANDLERS_MAP = new HashMap<>();
+```
+
+###### getTypeHandler
+
+``` java
+private <T> TypeHandler<T> getTypeHandler(Type type, JdbcType jdbcType) {
+    if (ParamMap.class.equals(type)) {
+      return null;
+    }
+  	//根据参数的类型，获取JDBCType和TypeHandler的对应关系
+  	//如参数类型为Integer,则JDBCType默认为Integer，对应的TypeHandler为IntegerTypeHandler
+    Map<JdbcType, TypeHandler<?>> jdbcHandlerMap = getJdbcHandlerMap(type);
+    TypeHandler<?> handler = null;
+    if (jdbcHandlerMap != null) {
+      //获取实际的TypeHandler
+      handler = jdbcHandlerMap.get(jdbcType);
+      if (handler == null) {
+        handler = jdbcHandlerMap.get(null);
+      }
+      if (handler == null) {
+        // #591
+        handler = pickSoleHandler(jdbcHandlerMap);
+      }
+    }
+    // type drives generics here
+    return (TypeHandler<T>) handler;
+}
+```
+
+##### IntegerTypeHandler
+
+###### setNonNullParameter
+
+``` java
+@Override
+public void setNonNullParameter(PreparedStatement ps, int i, Integer parameter, JdbcType jdbcType)
+      throws SQLException {
+  	//设置参数
+    ps.setInt(i, parameter);
+}
+```
 
 #### 执行Sql
+
+``` java
+RoutingStatementHandler#query	
+  PreparedStatementHandler#query //真正的委托类执行Sql
+  	PreparedStatement#execute  //执行Sql
+  	DefaultResultSetHandler#handleResultSets //处理返回结果
+  	
+```
+
+##### RoutingStatementHandler
+
+###### query
+
+``` java
+@Override
+public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+    return delegate.<E>query(statement, resultHandler); //给委托类进行查询
+}
+```
+
+##### PreparedStatementHandler
+
+###### query
+
+``` java
+@Override
+public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+    PreparedStatement ps = (PreparedStatement) statement; //获取statement
+    ps.execute(); //执行查询
+    return resultSetHandler.handleResultSets(ps); //处理结果集
+}
+```
+
+
+
+#### 设置结果集(ResultSetHandler)
+
+### 接口方式执行流程(Mapper代理)
+
+#### 解析接口
+
+``` java
+XMLMapperBuilder#parse()  //解析单个mapper文件
+XMLMapperBuilder#bindMapperForNamespace() //根据命名空间绑定mapper
+  Configuration#addMapper(Class)	//Configuration中封装了MapperRegistry,将对应的接口Class加入到mapper集合中
+  	MapperRegistry#addMapper(Class) //MapperRegistry中封装了Class和MapperProxyFactory的对应关系
+  		MapperAnnotationBuilder#parse() //解析注解
+```
+
+##### XMLMapperBuilder
+
+###### parse
+
+``` java
+public void parse() {
+    if (!configuration.isResourceLoaded(resource)) {
+      configurationElement(parser.evalNode("/mapper"));
+      configuration.addLoadedResource(resource);
+      //绑定命名空间和mapper对象之间的关系，用于生成接口代理及注解方式开发的功能
+      bindMapperForNamespace();
+    }
+
+    parsePendingResultMaps();
+    parsePendingCacheRefs();
+    parsePendingStatements();
+ }
+```
+
+###### bindMapperForNamespace
+
+``` java
+private void bindMapperForNamespace() {
+    String namespace = builderAssistant.getCurrentNamespace();
+    if (namespace != null) {
+      Class<?> boundType = null;
+      try {
+        boundType = Resources.classForName(namespace);
+      } catch (ClassNotFoundException e) {
+        //ignore, bound type is not required
+      }
+      if (boundType != null) {
+        if (!configuration.hasMapper(boundType)) {
+          // Spring may not know the real resource name so we set a flag
+          // to prevent loading again this resource from the mapper interface
+          // look at MapperAnnotationBuilder#loadXmlResource
+          configuration.addLoadedResource("namespace:" + namespace);
+          //将对象添加到Configuration中MapperRegistry对象中去
+          configuration.addMapper(boundType);
+        }
+      }
+    }
+ }
+```
+
+##### Configuration
+
+###### addMapper
+
+``` java
+public <T> void addMapper(Class<T> type) {
+    mapperRegistry.addMapper(type);
+}
+```
+
+##### MapperRegistry
+
+``` java
+//class对象与MapperProxyFactory的对应关系
+private final Map<Class<?>, MapperProxyFactory<?>> knownMappers = new HashMap<>();
+```
+
+
+
+###### addMapper
+
+``` java
+public <T> void addMapper(Class<T> type) {
+    if (type.isInterface()) {
+      if (hasMapper(type)) {
+        throw new BindingException("Type " + type + " is already known to the MapperRegistry.");
+      }
+      boolean loadCompleted = false;
+      try {
+        //生成一个MapperProxyFactory，添加到对应关系中去
+        knownMappers.put(type, new MapperProxyFactory<>(type));
+        // It's important that the type is added before the parser is run
+        // otherwise the binding may automatically be attempted by the
+        // mapper parser. If the type is already known, it won't try.
+        MapperAnnotationBuilder parser = new MapperAnnotationBuilder(config, type);
+        //解析注解，解析注解里面也包含了解析单个Mapper.xml中的内容，和上面的Xml文件一致
+        parser.parse();
+        loadCompleted = true;
+      } finally {
+        if (!loadCompleted) {
+          knownMappers.remove(type);
+        }
+      }
+    }
+  }
+```
+
+
+
+#### 获取代理对象
+
+``` java
+DefaultSqlSession#getMapper(Class)  //获取代理对象
+  Configuration#getMapper(Class,SqlSession) //通过Configuration获取代理对象
+  	MapperRegistry#getMapper(Class,SqlSession) //通过MapperRegistry获取代理对象
+  		MapperProxyFactory#newInstance(SqlSession) //MapperRegistry中封装了class和MapperProFactory的对应关系，从而调用MapperProxyFactory的newInstance方法生成代理对象
+  		MapperProxyFactory#newInstance(MapperProxy) //Mybatis获取代理使用了JDK代理，MapperProxy继承了InvocationHandler，该类用于具体执行代理方法
+```
+
+##### DefaultSqlSession
+
+###### getMapper
+
+``` java
+public <T> T getMapper(Class<T> type) {
+    return configuration.<T>getMapper(type, this);//从Configuration中获取代理对象
+}
+```
+
+##### Configuration
+
+###### getMapper
+
+``` java
+public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+    return mapperRegistry.getMapper(type, sqlSession);//从MapperRegistry中获取代理对象
+}
+```
+
+##### MapperRegistry
+
+###### getMapper
+
+``` java
+public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+  	//获取MapperProxyFactory，mapper代理对象工厂
+    final MapperProxyFactory<T> mapperProxyFactory = (MapperProxyFactory<T>) knownMappers.get(type);
+    if (mapperProxyFactory == null) {
+      throw new BindingException("Type " + type + " is not known to the MapperRegistry.");
+    }
+    try {
+      //生成代理类
+      return mapperProxyFactory.newInstance(sqlSession);
+    } catch (Exception e) {
+      throw new BindingException("Error getting mapper instance. Cause: " + e, e);
+    }
+}
+```
+
+##### MapperProxyFactory
+
+###### newInstance
+
+``` java
+protected T newInstance(MapperProxy<T> mapperProxy) {
+  	//使用JDK动态代理生成代理对象
+    return (T) Proxy.newProxyInstance(mapperInterface.getClassLoader(), new Class[] { mapperInterface }, mapperProxy);
+}
+
+public T newInstance(SqlSession sqlSession) {
+  	//创建MapperProxy,是一个InvocationHandler
+  	//该类使用了JDK动态代理，执行代理方法和目标方法
+    final MapperProxy<T> mapperProxy = new MapperProxy<>(sqlSession, mapperInterface, methodCache);
+    return newInstance(mapperProxy);
+}
+```
+
+#### 执行流程
+
+``` java
+MapperProxy#invoke //执行代理方法
+	MapperProxy#cachedMapperMethod  //获取缓存中MappedMethod
+  	MapperMethod#execute	//执行具体的Sql方法
+```
+
+##### MapperProxy
+
+###### invoke
+
+``` java
+public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    try {
+      //如果是Object对象，则直接执行目标方法，说明代理的不是一个接口
+      if (Object.class.equals(method.getDeclaringClass())) {
+        return method.invoke(this, args);
+      } else if (isDefaultMethod(method)) {
+        return invokeDefaultMethod(proxy, method, args);
+      }
+    } catch (Throwable t) {
+      throw ExceptionUtil.unwrapThrowable(t);
+    }
+  	//获取缓存中的MapperMethod对象
+    final MapperMethod mapperMethod = cachedMapperMethod(method);
+  	//执行Sql语句
+    return mapperMethod.execute(sqlSession, args);
+}
+```
+
+###### cachedMapperMethod
+
+``` java
+private MapperMethod cachedMapperMethod(Method method) {
+  	//如果map中存在则直接返回，不存在这放入map后返回
+    return methodCache.computeIfAbsent(method, k -> new MapperMethod(mapperInterface, method, sqlSession.getConfiguration()));
+}
+```
+
+##### MapperMethod
+
+``` java
+public Object execute(SqlSession sqlSession, Object[] args) {
+    Object result;
+    switch (command.getType()) {
+      case INSERT: {
+    	Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.insert(command.getName(), param));
+        break;
+      }
+      case UPDATE: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.update(command.getName(), param));
+        break;
+      }
+      case DELETE: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.delete(command.getName(), param));
+        break;
+      }
+      case SELECT:
+        //配置了ResultHandler
+        if (method.returnsVoid() && method.hasResultHandler()) {
+          executeWithResultHandler(sqlSession, args);
+          result = null;
+        } else if (method.returnsMany()) {
+          result = executeForMany(sqlSession, args);
+        } else if (method.returnsMap()) {
+          //返回多条数据，改方法里面调用的是sqlSession.selectList
+          result = executeForMap(sqlSession, args);
+        } else if (method.returnsCursor()) {
+          result = executeForCursor(sqlSession, args);
+        } else {
+          Object param = method.convertArgsToSqlCommandParam(args);
+          //执行sql，和普通的执行方法一样最终调用了SqlSession.selectOne方法
+          result = sqlSession.selectOne(command.getName(), param);
+          if (method.returnsOptional() &&
+              (result == null || !method.getReturnType().equals(result.getClass()))) {
+            result = Optional.ofNullable(result);
+          }
+        }
+        break;
+      case FLUSH:
+        result = 	.flushStatements();
+        break;
+      default:
+        throw new BindingException("Unknown execution method for: " + command.getName());
+    }
+    if (result == null && method.getReturnType().isPrimitive() && !method.returnsVoid()) {
+      throw new BindingException("Mapper method '" + command.getName()
+          + " attempted to return null from a method with a primitive return type (" + method.getReturnType() + ").");
+    }
+    return result;
+  }
+```
 
